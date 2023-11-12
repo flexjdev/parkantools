@@ -26,21 +26,23 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=package_description)
 
     subparsers = parser.add_subparsers(dest='command', required=True)
-    nres.args.setup_subparser(subparsers)
+    nres_command_parsers = nres.args.setup_subparser(subparsers)
 
-    verbosity_group = parser.add_mutually_exclusive_group()
-    verbosity_group.add_argument(
-        '-v',
-        '--verbose',
-        action='store_true',
-        help=''
-    )
-    verbosity_group.add_argument(
-        '-s',
-        '--silent',
-        action='store_true',
-        help=''
-    )
+    # common arguments supported by all sub-commands
+    for command_parser in nres_command_parsers:
+        verbosity_group = command_parser.add_mutually_exclusive_group()
+        verbosity_group.add_argument(
+            '-v',
+            '--verbose',
+            action='store_true',
+            help=''
+        )
+        verbosity_group.add_argument(
+            '-s',
+            '--silent',
+            action='store_true',
+            help=''
+        )
 
     args = parser.parse_args()
 

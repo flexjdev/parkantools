@@ -1,7 +1,9 @@
 import logging
+import os
 import struct
 
 from pathlib import Path
+from parkanio.fileio import *
 
 logger = logging.getLogger(__name__)
 
@@ -25,15 +27,29 @@ class ArchivedFileMetadata:
             f"ID: {self.file_id}"
 
 
-    def __init__(self, buffer):
+    def decode(buffer):
         metadata = struct.unpack(ArchivedFileMetadata.STRUCT_FORMAT, buffer)
         type, size, x, name, offset, id = metadata
 
-        self.file_type = type.decode('utf-8').rstrip('\x00')
-        self.file_name = name.decode('utf-8').rstrip('\x00')
-        self.file_size = size
-        self.file_offset = offset
-        self.file_id = id
+        return ArchivedFileMetadata(
+            type.decode('utf-8').rstrip('\x00'),
+            size,
+            name.decode('utf-8').rstrip('\x00'),
+            offset,
+            id
+        )
+
+
+    def bytes(self):
+        return struct.pack(
+            ArchivedFileMetadata.STRUCT_FORMAT,
+            self.file_type,
+            self.file_size,
+            0x0000, # x
+            bytes(self.file_name, 'utf-8'),
+            self.file_offset,
+            self.file_id
+        )
 
 
 class NresArchiveMetadata:
@@ -51,7 +67,7 @@ class NresArchiveMetadata:
         return f"Files: {self.file_count}, Size: {self.archive_size}"
 
 
-    def __init__(self, buffer):
+    def decode(buffer):
         if len(buffer) != NresArchiveMetadata.METADATA_SIZE:
             error_description = \
                 f"Incorrect metadata buffer size. Got {len(buffer)}, " \
@@ -67,8 +83,17 @@ class NresArchiveMetadata:
                 f"{NresArchiveMetadata.SIGNATURE:#x}"
             raise ValueError(error_description)
 
-        self.file_count = file_count
-        self.archive_size = archive_size
+        return NresArchiveMetadata(0x0000, file_count, archive_size)
+
+
+    def bytes(self):
+        return struct.pack(
+            NresArchiveMetadata.STRUCT_FORMAT,
+            NresArchiveMetadata.SIGNATURE,
+            0x0100,
+            self.file_count,
+            self.archive_size
+        )
 
 
 def decode_table_of_contents(buffer, file_count):
@@ -87,30 +112,14 @@ def decode_table_of_contents(buffer, file_count):
         entry_end = (i + 1) * ArchivedFileMetadata.METADATA_SIZE
 
         entry_buffer = buffer[entry_start:entry_end]
-        metadata = ArchivedFileMetadata(entry_buffer)
+        metadata = ArchivedFileMetadata.decode(entry_buffer)
 
         entries.append(metadata)
 
     return entries
 
 
-def create_directory_if_needed(output_dir_path, dry_run):
-    path = Path(output_dir_path)
-    if path.is_file():
-        raise ValueError(f"Output directory is a file")
-
-    if not path.is_dir():
-        if dry_run:
-            logger.info(f"Dry-run: skipping creating directory at {path}")
-            return
-        logger.debug(f"Creating directory at {path}")
-        path.mkdir(parents=True, exist_ok=True)
-
-
 def unpack_file(metadata, archive_file, out_dir, archive_name, dry_run, force):
-    full_out_dir = Path(out_dir).joinpath(archive_name)
-    create_directory_if_needed(full_out_dir, dry_run)
-
     # Join file name with archive name to give more context in logs
     cxt_name = Path(archive_name).joinpath(metadata.file_name)
     logger.debug(f"Unpacking {cxt_name} ({metadata.file_size}) bytes")
@@ -129,16 +138,9 @@ def unpack_file(metadata, archive_file, out_dir, archive_name, dry_run, force):
         raise ValueError(error_description)
 
     logger.debug(f"Copying archived file {cxt_name} to {full_out_path}")
-    if full_out_path.is_file():
-        if not force:
-            error_description = \
-                f"File {full_out_path} already exists, skipping copying. " \
-                f"Use -f or --force to enable overwriting existing files."
-            logger.info(error_description)
-            # raise ValueError(error_description)
-            return  # It's not that serious, log it and move on to the next one
 
-        logger.debug(f"Will overwrite existing file {full_out_path}")
+    if not can_modify_file(full_out_path, force):
+        return
 
     if dry_run:
         logger.info(f"Dry-run: skipping writing file {full_out_path}")
@@ -150,13 +152,11 @@ def unpack_file(metadata, archive_file, out_dir, archive_name, dry_run, force):
 
 
 def unarchive(archive_path, out_dir, arch_name, include, dry_run, force):
-    create_directory_if_needed(out_dir, dry_run)
-
     logger.info(f"Unarchiving {archive_path} to {out_dir}")
     with open(archive_path, 'rb') as arch_file:  # archive file
         logger.debug("Reading and decoding archive metadata")
         metadata_buffer = arch_file.read(NresArchiveMetadata.METADATA_SIZE)
-        metadata = NresArchiveMetadata(metadata_buffer)
+        metadata = NresArchiveMetadata.decode(metadata_buffer)
         logger.debug(f"Metadata: {metadata}")
 
         # Calculate position at which the table of contents should start
@@ -169,4 +169,56 @@ def unarchive(archive_path, out_dir, arch_name, include, dry_run, force):
         toc = decode_table_of_contents(toc_buffer, metadata.file_count)
 
         for entry in toc:
+            logger.debug(f"Processing toc entry: {entry}")
             unpack_file(entry, arch_file, out_dir, arch_name, dry_run, force)
+
+
+def archive(file_paths, out_path, dry_run, force):
+
+    if not can_modify_file(out_path, force):
+        return
+
+    file_count = len(file_paths)
+    file_sizes = []
+    # Do this now so we fail early if something is wrong with one of the files,
+    # Before we even create the archive
+    for path in file_paths:
+        file_sizes.append(os.path.getsize(path))
+
+    total_size = NresArchiveMetadata.METADATA_SIZE \
+        + sum(file_sizes) \
+        + file_count * ArchivedFileMetadata.METADATA_SIZE
+
+    header = NresArchiveMetadata(0x0000, file_count, total_size)
+
+    logger.info(f"Creating archive at {out_path}")
+    with open(out_path, 'wb') as arch_file:
+        arch_file.write(header.bytes())
+
+        toc_entries = []
+        file_id = 0
+        for path in file_paths:
+
+            file_offset = arch_file.tell()
+            file_name = name(path)
+
+            with open(path, 'rb') as file:
+                file_type = struct.unpack('4s', file.read(4))[0]
+                file.seek(0)
+                arch_file.write(file.read())
+                file_size = file.tell()
+
+            toc_entry = ArchivedFileMetadata(
+                file_type,
+                file_size,
+                file_name,
+                file_offset,
+                file_id
+            )
+
+            logger.debug(f"Appending entry to table of contents: {toc_entry}")
+            toc_entries.append(toc_entry)
+            file_id += 1
+
+        for entry in toc_entries:
+            arch_file.write(entry.bytes())
